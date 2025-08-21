@@ -1,0 +1,280 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebRTC Demo — Phone</title>
+    <link rel="stylesheet" href="style/phone.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Phone Publisher</h1>
+      </header>
+      <div class="panel">
+        <div class="row" style="margin-bottom:12px;">
+          <div class="hint">Room: <code id="roomId">-</code></div>
+        </div>
+        <div class="row" style="margin-bottom:12px;">
+          <button id="startBtn">Start Camera</button>
+          <select id="res">
+            <option value="qvga">320x240 (Low)</option>
+            <option value="vga" selected>640x480</option>
+            <option value="hd">1280x720</option>
+          </select>
+          <select id="cam">
+            <option value="auto" selected>Auto</option>
+            <option value="back">Back camera</option>
+            <option value="front">Front camera</option>
+          </select>
+          <label class="hint"><input type="checkbox" id="enableDet" checked style="margin-right:6px;"/> On-device detection (WASM)</label>
+        </div>
+        <video id="preview" autoplay playsinline muted></video>
+      </div>
+    </div>
+
+    <!-- TFJS + WASM backend + COCO-SSD (for on-device detection) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.19.0/dist/tf.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.19.0/dist/tf-backend-wasm.min.js" defer></script>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js" defer></script>
+
+    <script>
+      const params = new URLSearchParams(location.search);
+      const roomId = params.get('room');
+      document.getElementById('roomId').textContent = roomId || '-';
+      const startBtn = document.getElementById('startBtn');
+      const resSel = document.getElementById('res');
+      const preview = document.getElementById('preview');
+      const camSel = document.getElementById('cam');
+      const enableDet = document.getElementById('enableDet');
+      // Default detection based on MODE from server
+      fetch('/api/config').then(r=>r.json()).then(cfg => {
+        if (cfg && cfg.mode) {
+          enableDet.checked = (cfg.mode === 'wasm');
+        }
+      }).catch(()=>{});
+
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+      let pc = null;
+      let stream = null;
+      let dcMeta = null;
+      let sendTimer = null;
+      let frameId = 0;
+      let model = null;
+      let procTimer = null;
+      let processing = false;
+      const off = document.createElement('canvas');
+      const offCtx = off.getContext('2d');
+      let statsTimer = null;
+      let lastBytesSent = null;
+      let lastSentTs = null;
+
+      function resolutionPreset(value) {
+        if (value === 'qvga') return { width: { ideal: 320 }, height: { ideal: 240 }, frameRate: { ideal: 15 } };
+        if (value === 'vga') return { width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 24 } };
+        if (value === 'hd') return { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+        return {};
+      }
+
+      function mergeConstraints(base, extra) {
+        return { video: { ...base, ...extra }, audio: false };
+      }
+
+      async function getStreamWithCamera(resConstraints, camChoice) {
+        // Try preferred camera first; fallback to generic if needed
+        try {
+          if (camChoice === 'back') {
+            // Try exact environment first
+            return await navigator.mediaDevices.getUserMedia(mergeConstraints(resConstraints, { facingMode: { exact: 'environment' } }));
+          }
+          if (camChoice === 'front') {
+            return await navigator.mediaDevices.getUserMedia(mergeConstraints(resConstraints, { facingMode: 'user' }));
+          }
+          // auto
+          return await navigator.mediaDevices.getUserMedia({ video: resConstraints, audio: false });
+        } catch (e1) {
+          try {
+            if (camChoice === 'back') {
+              // Relax to non-exact environment (Safari compatibility)
+              return await navigator.mediaDevices.getUserMedia(mergeConstraints(resConstraints, { facingMode: 'environment' }));
+            }
+          } catch (e2) {
+            // Fallback to generic video
+            return await navigator.mediaDevices.getUserMedia({ video: resConstraints, audio: false });
+          }
+        }
+      }
+
+      ws.addEventListener('open', () => {
+        if (roomId) ws.send(JSON.stringify({ type: 'join', roomId }));
+      });
+
+      ws.addEventListener('message', async (ev) => {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'joined') return;
+        if (!pc) return;
+        if (msg.type === 'answer') {
+          await pc.setRemoteDescription(msg.answer);
+        } else if (msg.type === 'candidate') {
+          try { await pc.addIceCandidate(msg.candidate); } catch {}
+        }
+      });
+
+      async function start() {
+        if (!roomId) {
+          alert('Missing room. Open from QR on laptop.');
+          return;
+        }
+        // Clean up any existing session
+        try {
+          if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+          if (procTimer) { clearInterval(procTimer); procTimer = null; }
+          if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+          if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+          if (pc) { pc.close(); pc = null; }
+        } catch {}
+
+        const resConstraints = resolutionPreset(resSel.value);
+        stream = await getStreamWithCamera(resConstraints, camSel.value);
+        preview.srcObject = stream;
+        pc = new RTCPeerConnection({
+          iceServers: [ { urls: ['stun:stun.l.google.com:19302'] } ]
+        });
+        // Create DataChannel for metadata before creating offer
+        dcMeta = pc.createDataChannel('meta');
+        dcMeta.onopen = () => {
+          if (sendTimer) clearInterval(sendTimer);
+          // If detection disabled, keep sending empty messages to drive metrics ~10 FPS
+          sendTimer = setInterval(() => {
+            if (dcMeta.readyState !== 'open') return;
+            const now = Date.now();
+            const payload = {
+              frame_id: frameId++,
+              capture_ts: now,
+              recv_ts: now,
+              inference_ts: now,
+              detections: []
+            };
+            try { dcMeta.send(JSON.stringify(payload)); } catch {}
+          }, 100);
+        };
+        dcMeta.onmessage = (e) => {
+          try {
+            const msg = JSON.parse(e.data);
+            if (msg.type === 'sync_req') {
+              // Respond with phone clock and echo original t0
+              const resp = { type: 'sync_res', t_phone: Date.now(), t0: msg.t0 };
+              try { dcMeta.send(JSON.stringify(resp)); } catch {}
+            }
+          } catch {}
+        };
+        dcMeta.onclose = () => { if (sendTimer) { clearInterval(sendTimer); sendTimer = null; } };
+        stream.getTracks().forEach(t => pc.addTrack(t, stream));
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) ws.send(JSON.stringify({ type: 'candidate', roomId, candidate: ev.candidate }));
+        };
+        const offer = await pc.createOffer({ offerToReceiveVideo: false });
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', roomId, offer }));
+
+        // Initialize WASM backend + model if enabled
+        initDetectionIfEnabled();
+
+        // Start uplink bandwidth sampling (~1 Hz)
+        if (statsTimer) clearInterval(statsTimer);
+        statsTimer = setInterval(sampleUplinkKbps, 1000);
+      }
+
+      async function initDetectionIfEnabled() {
+        if (!enableDet.checked) return;
+        try {
+          // Ensure TFJS is loaded
+          if (!window.tf || !window.cocoSsd) return;
+          tf.wasm.setWasmPaths('https://cdn.jsdelivr.net/npm/@tensorflow/tfjs-backend-wasm@4.19.0/dist/');
+          await tf.setBackend('wasm');
+          await tf.ready();
+          model = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+          // Prepare processing at ~10 FPS with frame dropping
+          if (procTimer) clearInterval(procTimer);
+          procTimer = setInterval(processLatestFrame, 100);
+        } catch (e) {
+          console.warn('Detection init failed:', e);
+        }
+      }
+
+      function sizeOffscreen() {
+        // Default downscale to 320x240 for low resource
+        off.width = 320; off.height = 240;
+      }
+
+      async function processLatestFrame() {
+        if (!model || !dcMeta || dcMeta.readyState !== 'open') return;
+        if (processing) return; // drop older frames
+        processing = true;
+        try {
+          sizeOffscreen();
+          // Draw current preview frame into offscreen canvas
+          offCtx.drawImage(preview, 0, 0, off.width, off.height);
+          const captureTs = Date.now();
+          const preds = await model.detect(off, 10);
+          // Filter low-confidence predictions to reduce flicker
+          const CONF_THRESH = 0.5;
+          const detections = [];
+          for (const p of preds) {
+            if (p.score < CONF_THRESH) continue;
+            // p.bbox: [x, y, width, height] in pixels relative to input image
+            const [x, y, w, h] = p.bbox;
+            const xmin = Math.max(0, Math.min(1, x / off.width));
+            const ymin = Math.max(0, Math.min(1, y / off.height));
+            const xmax = Math.max(0, Math.min(1, (x + w) / off.width));
+            const ymax = Math.max(0, Math.min(1, (y + h) / off.height));
+            detections.push({ label: p.class, score: p.score, xmin, ymin, xmax, ymax });
+          }
+          const now = Date.now();
+          const payload = {
+            frame_id: frameId++,
+            capture_ts: captureTs,
+            recv_ts: captureTs,
+            inference_ts: now,
+            detections
+          };
+          try { dcMeta.send(JSON.stringify(payload)); } catch {}
+        } catch (e) {
+          // Non-fatal; continue next tick
+        } finally {
+          processing = false;
+        }
+      }
+
+      async function sampleUplinkKbps() {
+        if (!pc || !dcMeta || dcMeta.readyState !== 'open') return;
+        try {
+          const stats = await pc.getStats();
+          let bytes = null;
+          let ts = null;
+          stats.forEach(report => {
+            if (report.type === 'outbound-rtp' && report.kind === 'video') {
+              bytes = report.bytesSent;
+              ts = report.timestamp; // ms
+            }
+          });
+          if (bytes == null || ts == null) return;
+          if (lastBytesSent != null && lastSentTs != null) {
+            const deltaBytes = bytes - lastBytesSent;
+            const deltaMs = ts - lastSentTs;
+            if (deltaBytes > 0 && deltaMs > 0) {
+              const kbps = (deltaBytes * 8) / deltaMs; // kbits per ms => kbps
+              try { dcMeta.send(JSON.stringify({ type: 'uplink_kbps', kbps })); } catch {}
+            }
+          }
+          lastBytesSent = bytes;
+          lastSentTs = ts;
+        } catch {}
+      }
+
+      startBtn.addEventListener('click', start);
+    </script>
+  </body>
+  </html>
+
+

@@ -1,0 +1,27 @@
+{
+  "name": "webrtc-vlm-demo",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Real-time WebRTC multi-object detection demo (wasm/server modes)",
+  "main": "server/index.js",
+  "scripts": {
+    "start": "node server/index.js",
+    "dev": "nodemon server/index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "localtunnel": "^2.0.2",
+    "qrcode": "^1.5.3",
+    "uuid": "^9.0.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.4"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
+
+

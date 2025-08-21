@@ -1,0 +1,327 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WebRTC Demo — Receiver</title>
+    <link rel="stylesheet" href="style/index.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header>
+        <h1>Real-Time WebRTC VLM Object-Detector</h1>
+      </header>
+
+      <div class="panel">
+        <div class="controls row">
+          <button id="newRoomBtn">Create Room</button>
+          <div>Room: <code id="roomId">-</code></div>
+          <button id="saveMetricsBtn">Save metrics.json</button>
+        </div>
+
+        <div class="content">
+          <div class="video-wrap">
+            <canvas id="canvas" width="640" height="480" style="display:none;"></canvas>
+            <video id="video" autoplay playsinline></video>
+          </div>
+          <div class="side">
+            <div id="metricsBox" class="metrics">Metrics: -</div>
+            <div id="qr" class="qr-card">
+              <span class="hint">Create a room to get a QR code</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+      let roomId = null;
+      let pc = null;
+      let wsOpen = false;
+      let joinSent = false;
+      let clockDeltaMs = 0; // phone_time - receiver_time
+      const videoEl = document.getElementById('video');
+      const videoWrapEl = document.querySelector('.video-wrap');
+      const canvasEl = document.getElementById('canvas');
+      const ctx = canvasEl.getContext('2d');
+      let overlayCanvas = null;
+      let overlayCtx = null;
+      // Metrics buffers
+      const metrics = {
+        e2e: [], net: [], srv: [], frames: 0, startTs: 0, uplinkKbps: [], downlinkKbps: []
+      };
+      let downStatsTimer = null;
+      let lastBytesRecv = null;
+      let lastRecvTs = null;
+      const statsBox = document.getElementById('metricsBox');
+
+      function percentile(arr, p) {
+        if (!arr.length) return 0;
+        const a = [...arr].sort((x,y)=>x-y);
+        const idx = Math.min(a.length-1, Math.floor((p/100)*a.length));
+        return a[idx];
+      }
+      function median(arr) { return percentile(arr, 50); }
+      function updateStatsBox() {
+        const seconds = Math.max(1, (Date.now() - metrics.startTs) / 1000);
+        const fps = (metrics.frames / seconds).toFixed(1);
+        const med = Math.round(median(metrics.e2e));
+        const p95 = Math.round(percentile(metrics.e2e, 95));
+        const netMed = Math.round(median(metrics.net));
+        const srvMed = Math.round(median(metrics.srv));
+        const up = Math.round(median(metrics.uplinkKbps));
+        const down = Math.round(median(metrics.downlinkKbps));
+        statsBox.textContent = `FPS ${fps} | E2E ms p50 ${med} p95 ${p95} | Net ${netMed} | Srv ${srvMed} | Up ${isFinite(up)?up:'-'} kbps | Down ${isFinite(down)?down:'-'} kbps`;
+      }
+
+      async function downloadMetricsJSON() {
+        if (metrics.frames === 0) {
+            alert("No metrics to save yet.");
+            return;
+        }
+        const seconds = Math.max(1, (Date.now() - metrics.startTs) / 1000);
+        const fps = metrics.frames / seconds;
+        const body = {
+          median_e2e_ms: median(metrics.e2e), p95_e2e_ms: percentile(metrics.e2e, 95),
+          median_network_ms: median(metrics.net), median_server_ms: median(metrics.srv),
+          fps: Number(fps.toFixed(2)), uplink_kbps: Math.round(median(metrics.uplinkKbps)) || null,
+          downlink_kbps: Math.round(median(metrics.downlinkKbps)) || null
+        };
+        try {
+          await fetch('/api/metrics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+          const a = document.createElement('a');
+          const blob = new Blob([JSON.stringify(body, null, 2)], { type: 'application/json' });
+          a.href = URL.createObjectURL(blob);
+          a.download = 'metrics.json';
+          a.click();
+        } catch (e) { alert('Failed to save metrics'); }
+      }
+
+      setInterval(async () => {
+        if (!metrics.startTs) return;
+        try {
+          const seconds = Math.max(1, (Date.now() - metrics.startTs) / 1000);
+          const fps = metrics.frames / seconds;
+          const body = {
+            median_e2e_ms: median(metrics.e2e), p95_e2e_ms: percentile(metrics.e2e, 95),
+            median_network_ms: median(metrics.net), median_server_ms: median(metrics.srv),
+            fps: Number(fps.toFixed(2)), uplink_kbps: Math.round(median(metrics.uplinkKbps)) || null,
+            downlink_kbps: Math.round(median(metrics.downlinkKbps)) || null
+          };
+          await fetch('/api/metrics', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+        } catch {}
+      }, 1000);
+      const newRoomBtn = document.getElementById('newRoomBtn');
+      newRoomBtn.disabled = true;
+
+      function log(...args) { console.log('[receiver]', ...args); }
+
+      function connectWS() {
+        ws.addEventListener('open', () => {
+          wsOpen = true; newRoomBtn.disabled = false; log('ws open');
+          if (roomId && !joinSent) { ws.send(JSON.stringify({ type: 'join', roomId })); joinSent = true; }
+        });
+        ws.addEventListener('message', async (ev) => {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'joined') return;
+          if (!pc && msg.type === 'offer') createPeer();
+          if (msg.type === 'offer') {
+            await pc.setRemoteDescription(msg.offer);
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: 'answer', roomId, answer }));
+          } else if (msg.type === 'candidate') {
+            try { await pc.addIceCandidate(msg.candidate); } catch {}
+          }
+        });
+      }
+
+      function startClockSync(dc) {
+        try { const t0 = Date.now(); dc.send(JSON.stringify({ type: 'sync_req', t0 })); } catch {}
+      }
+
+      const tracks = new Map(); let nextId = 1;
+      function iou(a, b) {
+        const interX = Math.max(0, Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x));
+        const interY = Math.max(0, Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+        const inter = interX * interY;
+        const union = a.w * a.h + b.w * b.h - inter;
+        return union > 0 ? inter / union : 0;
+      }
+      function updateTracks(dets) {
+        const candidates = dets.map(d => ({
+          x: d.xmin * overlayCanvas.width, y: d.ymin * overlayCanvas.height,
+          w: (d.xmax - d.xmin) * overlayCanvas.width, h: (d.ymax - d.ymin) * overlayCanvas.height,
+          label: d.label, score: d.score
+        }));
+        for (const [id, t] of tracks) t.ttl -= 1;
+        for (const cand of candidates) {
+          let bestId = null, bestIoU = 0;
+          for (const [id, t] of tracks) {
+            const val = iou(t, cand); if (val > bestIoU) { bestIoU = val; bestId = id; }
+          }
+          if (bestId && bestIoU > 0.2) {
+            const t = tracks.get(bestId);
+            const alpha = 0.5;
+            t.x = t.x * (1 - alpha) + cand.x * alpha; t.y = t.y * (1 - alpha) + cand.y * alpha;
+            t.w = t.w * (1 - alpha) + cand.w * alpha; t.h = t.h * (1 - alpha) + cand.h * alpha;
+            t.label = cand.label; t.score = cand.score; t.ttl = 5;
+          } else { tracks.set(nextId++, { ...cand, ttl: 5 }); }
+        }
+        for (const [id, t] of [...tracks]) if (t.ttl <= 0) tracks.delete(id);
+        // Add/remove glowing class based on detection
+        if (tracks.size > 0) videoWrapEl.classList.add('detected');
+        else videoWrapEl.classList.remove('detected');
+      }
+      function renderTracks() {
+        if (!overlayCanvas || !overlayCtx) return;
+        const rect = videoEl.getBoundingClientRect();
+        const cw = Math.max(1, Math.floor(rect.width));
+        const ch = Math.max(1, Math.floor(rect.height));
+        if (overlayCanvas.width !== cw || overlayCanvas.height !== ch) {
+          overlayCanvas.style.width = cw + 'px'; overlayCanvas.style.height = ch + 'px';
+          overlayCanvas.width = cw; overlayCanvas.height = ch;
+        }
+        overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+        
+        // Pulse animation values
+        const pulse = (Math.sin(Date.now() / 200) + 1) / 2; // oscillates between 0 and 1
+        const baseLineWidth = 2;
+        const pulseLineWidth = baseLineWidth + pulse * 2; // Varies between 2 and 4
+        
+        for (const [id, t] of tracks) {
+          overlayCtx.strokeStyle = `rgba(0, 245, 255, ${0.7 + pulse * 0.3})`; // Varies opacity
+          overlayCtx.lineWidth = pulseLineWidth;
+          overlayCtx.shadowBlur = 15;
+          overlayCtx.shadowColor = `rgba(0, 245, 255, 0.7)`;
+          overlayCtx.strokeRect(t.x, t.y, t.w, t.h);
+          overlayCtx.shadowBlur = 0; // Reset shadow for text
+          
+          overlayCtx.fillStyle = 'rgba(0,0,0,0.7)';
+          overlayCtx.fillRect(t.x, Math.max(0, t.y - 22), Math.max(50, t.w * 0.5), 22);
+          overlayCtx.fillStyle = '#fff';
+          overlayCtx.font = '14px "JetBrains Mono", monospace';
+          overlayCtx.fillText(`${t.label} ${(t.score*100).toFixed(0)}%`, t.x + 6, Math.max(14, t.y - 6));
+        }
+        requestAnimationFrame(renderTracks);
+      }
+
+      function createPeer() {
+        pc = new RTCPeerConnection({ iceServers: [ { urls: ['stun:stun.l.google.com:19302'] } ] });
+        pc.ontrack = (ev) => {
+          videoEl.srcObject = ev.streams[0];
+          if (!overlayCanvas) {
+            overlayCanvas = document.createElement('canvas');
+            Object.assign(overlayCanvas.style, { position: 'absolute', left: '0', top: '0', pointerEvents: 'none', zIndex: '2' });
+            videoEl.parentNode.insertBefore(overlayCanvas, videoEl.nextSibling);
+            overlayCtx = overlayCanvas.getContext('2d');
+          }
+          let lastW = 0, lastH = 0;
+          const onResize = () => {
+            const rect = videoEl.getBoundingClientRect();
+            const targetW = Math.max(1, Math.floor(rect.width)); const targetH = Math.max(1, Math.floor(rect.height));
+            if (targetW === lastW && targetH === lastH) return;
+            lastW = targetW; lastH = targetH;
+            overlayCanvas.style.width = targetW + 'px'; overlayCanvas.style.height = targetH + 'px';
+            overlayCanvas.width = targetW; overlayCanvas.height = targetH;
+          };
+          videoEl.addEventListener('loadedmetadata', onResize); videoEl.addEventListener('resize', onResize);
+          window.addEventListener('resize', onResize); window.addEventListener('orientationchange', onResize);
+          try { const ro = new ResizeObserver(() => onResize()); ro.observe(videoEl); } catch {}
+          onResize(); requestAnimationFrame(renderTracks); startDownlinkSampling();
+        };
+        pc.onicecandidate = (ev) => {
+          if (ev.candidate) ws.send(JSON.stringify({ type: 'candidate', roomId, candidate: ev.candidate }));
+        };
+        pc.ondatachannel = (ev) => {
+          if (ev.channel.label === 'meta') {
+            const ch = ev.channel;
+            startClockSync(ch);
+            ch.onmessage = (e) => {
+              try {
+                const msg = JSON.parse(e.data);
+                if (msg.type === 'uplink_kbps' && typeof msg.kbps === 'number') {
+                  metrics.uplinkKbps.push(msg.kbps); if (metrics.uplinkKbps.length > 120) metrics.uplinkKbps.shift();
+                  return;
+                }
+                if (msg.type === 'sync_res' && typeof msg.t_phone === 'number') {
+                  clockDeltaMs = msg.t_phone - Date.now(); return;
+                }
+                if (!metrics.startTs) metrics.startTs = Date.now();
+                metrics.frames += 1;
+                const now = Date.now();
+                const cap = (msg.capture_ts || now) - clockDeltaMs;
+                const rcv = (msg.recv_ts || now) - clockDeltaMs;
+                const inf = (msg.inference_ts || now) - clockDeltaMs;
+                metrics.e2e.push(now - cap); metrics.net.push(rcv - cap); metrics.srv.push(inf - rcv);
+                if (metrics.e2e.length > 300) { metrics.e2e.shift(); metrics.net.shift(); metrics.srv.shift(); }
+                updateStatsBox(); updateTracks(msg.detections || []);
+              } catch {}
+            };
+            ch.onclose = () => {
+              Object.assign(metrics, { e2e: [], net: [], srv: [], frames: 0, startTs: 0 });
+              tracks.clear(); videoWrapEl.classList.remove('detected');
+              if (downStatsTimer) { clearInterval(downStatsTimer); downStatsTimer = null; }
+            };
+          }
+        };
+      }
+
+      function startDownlinkSampling() {
+        if (downStatsTimer) clearInterval(downStatsTimer);
+        downStatsTimer = setInterval(async () => {
+          if (!pc) return;
+          try {
+            const stats = await pc.getStats();
+            stats.forEach(report => {
+              if (report.type === 'inbound-rtp' && report.kind === 'video') {
+                const bytes = report.bytesReceived, ts = report.timestamp;
+                if (lastBytesRecv != null && lastRecvTs != null) {
+                  const deltaMs = ts - lastRecvTs;
+                  if (deltaMs > 0) {
+                    const kbps = (bytes - lastBytesRecv) * 8 / deltaMs;
+                    metrics.downlinkKbps.push(kbps);
+                    if (metrics.downlinkKbps.length > 120) metrics.downlinkKbps.shift();
+                  }
+                }
+                lastBytesRecv = bytes; lastRecvTs = ts;
+              }
+            });
+          } catch {}
+        }, 1000);
+      }
+
+      async function createRoom() {
+        newRoomBtn.disabled = true;
+        try {
+          const res = await fetch('/api/new-room');
+          const data = await res.json();
+          roomId = data.roomId;
+          document.getElementById('roomId').textContent = roomId;
+          const url = data.phoneUrl || (location.origin + data.phonePath);
+          const qrDiv = document.getElementById('qr');
+          qrDiv.innerHTML = ''; // Clear previous QR/hint
+          const img = new Image();
+          img.alt = 'QR Code to join room';
+          img.src = '/api/qr?data=' + encodeURIComponent(url);
+          qrDiv.appendChild(img);
+          qrDiv.classList.add('visible'); // Trigger fade-in animation
+          if (ws.readyState === 1) {
+            ws.send(JSON.stringify({ type: 'join', roomId })); joinSent = true;
+          } else {
+            ws.addEventListener('open', () => {
+              if (!joinSent) { ws.send(JSON.stringify({ type: 'join', roomId })); joinSent = true; }
+            }, { once: true });
+          }
+          createPeer();
+        } catch (e) { alert('Failed to create room. Check server.'); }
+        newRoomBtn.disabled = false;
+      }
+
+      document.getElementById('newRoomBtn').addEventListener('click', createRoom);
+      document.getElementById('saveMetricsBtn').addEventListener('click', downloadMetricsJSON);
+      connectWS();
+    </script>
+  </body>
+</html>
