@@ -1,7 +1,5 @@
 # Real-time WebRTC VLM Multi-Object Detection
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 A cross-device, real-time object detection demo using WebRTC for video streaming, WebAssembly (WASM) for on-device inference, and a modern browser UI. This project streams video from your phone to your laptop, runs a COCO-SSD object detection model directly in the browser, and displays live overlays with performance metrics.
 
 The entire inference pipeline runs on-device, requiring no cloud or dedicated GPU server.

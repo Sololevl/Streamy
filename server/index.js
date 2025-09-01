@@ -128,7 +128,7 @@ wss.on('connection', (ws) => {
     ws.on('error', () => leaveRoom(ws));
 });
 
-server.listen(PORT, async () => {
+server.listen(PORT, '0.0.0.0', async () => {
     console.log(`Server listening on http://localhost:${PORT}`);
     try {
         const shouldTunnel = String(process.env.TUNNEL || '').toLowerCase();
